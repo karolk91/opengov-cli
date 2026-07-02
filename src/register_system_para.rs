@@ -227,21 +227,47 @@ async fn register_polkadot_system_para(args: RegisterSystemParaArgs) {
 	proposal_hex.push_str(&hex::encode(&output.proposal.encoded));
 	fs::write(&fname, &proposal_hex).expect("write proposal file");
 
-	// Output summary
+	// Output summary — ordering depends on whether the delay/free-preimage path is used
 	println!("\n{}", "=".repeat(60));
 	println!("  REGISTER SYSTEM PARACHAIN {}", args.para_id);
 	println!("{}", "=".repeat(60));
 	println!();
-	println!("  STEP 1 — Submit on Relay Chain (permissionless):");
-	println!(
-		"    Use force_register_call.hex ({} bytes) as the bytes for",
-		output.force_register_info.length
-	);
-	println!("    Preimage.note_preimage in any wallet (e.g. Polkadot JS Apps).");
-	println!();
-	println!("  STEP 2 — Submit as referendum:");
-	println!("    opengov-cli submit-referendum \\");
-	println!("      --proposal \"{}\" \\", fname);
-	println!("      --network \"polkadot\" --track whitelistedcaller");
+
+	if args.delay_whitelist_dispatch_relay.is_some() {
+		// Delay path: whitelist_call marks the hash as requested during the delay window,
+		// so note_preimage becomes permissionless and free. Submit referendum FIRST.
+		println!("  STEP 1 — Submit as referendum:");
+		println!("    opengov-cli submit-referendum \\");
+		println!("      --proposal \"{}\" \\", fname);
+		println!("      --network \"polkadot\" --track whitelistedcaller");
+		println!();
+		println!("  STEP 2 — After enactment, submit on the relay chain (free):");
+		println!(
+			"    Use force_register_call.hex ({} bytes) as the bytes for",
+			output.force_register_info.length
+		);
+		println!("    Preimage.note_preimage. The hash was marked as requested by");
+		println!("    whitelist_call at enactment, so no deposit is taken. Must be");
+		println!(
+			"    submitted before the scheduled dispatch fires (+{} blocks).",
+			args.delay_whitelist_dispatch_relay.unwrap()
+		);
+	} else {
+		// No-delay path: dispatch fires in the same block as whitelist_call, so the
+		// preimage must exist beforehand. Submitter pays full deposit + fee.
+		println!("  STEP 1 — Submit on Relay Chain (permissioned — pays ~1000 DOT deposit):");
+		println!(
+			"    Use force_register_call.hex ({} bytes) as the bytes for",
+			output.force_register_info.length
+		);
+		println!("    Preimage.note_preimage. Must be stored before the referendum enacts;");
+		println!("    without --delay-whitelist-dispatch-relay, whitelist_call and dispatch");
+		println!("    fire in the same block. Deposit is refunded once governance consumes it.");
+		println!();
+		println!("  STEP 2 — Submit as referendum:");
+		println!("    opengov-cli submit-referendum \\");
+		println!("      --proposal \"{}\" \\", fname);
+		println!("      --network \"polkadot\" --track whitelistedcaller");
+	}
 	println!("{}", "=".repeat(60));
 }
