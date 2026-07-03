@@ -121,6 +121,29 @@ impl Network {
 			PolkadotBulletin => Ok(1_010),
 		}
 	}
+
+	/// Whether the network belongs to the Kusama family (as opposed to Polkadot).
+	pub(super) fn is_kusama(&self) -> bool {
+		use Network::*;
+		matches!(
+			self,
+			Kusama
+				| KusamaAssetHub
+				| KusamaEncointer
+				| KusamaBridgeHub
+				| KusamaPeople
+				| KusamaCoretime
+		)
+	}
+
+	/// The SS58 prefix used to display accounts of this network.
+	pub(super) fn ss58_prefix(&self) -> u16 {
+		if self.is_kusama() {
+			2
+		} else {
+			0
+		}
+	}
 }
 
 // Info and preferences provided by the user for proposal submission.

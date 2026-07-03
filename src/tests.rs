@@ -628,7 +628,7 @@ fn it_creates_constrained_print_output() {
 fn add_invulnerables_parses_and_encodes_a_single_account() {
 	use crate::add_invulnerables::{build_add_invulnerables_call, parse_accounts};
 
-	// One of the Bulletin genesis invulnerables (dapestake).
+	// One of the Bulletin genesis invulnerables.
 	let who = String::from("1A1WrKowzJD4yQQcETugEV5UWoNo1o7ujuA3f1fBfpxPjZL");
 	let accounts = parse_accounts(&[who], &Network::PolkadotBulletin);
 	let expected_account = "06def0ef07d9b5153276dd785525839706f4696c8cb86227a2af27fd7495ee63";

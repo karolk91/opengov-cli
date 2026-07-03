@@ -1,7 +1,6 @@
 use crate::*;
 use clap::Parser as ClapParser;
 use sp_core::crypto::{AccountId32 as SpAccountId32, Ss58Codec};
-use std::fs;
 
 /// Generate a proposal that adds invulnerable collators to a system chain.
 ///
@@ -42,15 +41,12 @@ pub(crate) struct AddInvulnerablesArgs {
 pub(crate) async fn add_invulnerables(prefs: AddInvulnerablesArgs) {
 	let network = parse_network(&prefs.network);
 	let accounts = parse_accounts(&prefs.who, &network);
-	let verified = if let Some(url) = &prefs.verify_via {
+	if let Some(url) = &prefs.verify_via {
 		verify_on_chain(url, &network, &accounts).await;
-		true
-	} else {
-		false
-	};
+	}
 	let target_call = build_add_invulnerables_call(&network, &accounts);
 	let proposal = wrap_for_governance(&target_call);
-	write_output(&prefs, &network, &target_call, &proposal, verified);
+	write_output(&prefs, &network, &target_call, &proposal);
 }
 
 // Map the user's chain name to a `Network`. Only chains that use `pallet-collator-selection` with
@@ -85,21 +81,10 @@ pub(crate) fn parse_network(input: &str) -> Network {
 	}
 }
 
-// The SS58 prefix that addresses of the given network are expected to use.
-fn ss58_prefix(network: &Network) -> u16 {
-	use Network::*;
-	match network {
-		Kusama | KusamaAssetHub | KusamaEncointer | KusamaBridgeHub | KusamaPeople
-		| KusamaCoretime => 2,
-		Polkadot | PolkadotAssetHub | PolkadotCollectives | PolkadotBridgeHub | PolkadotPeople
-		| PolkadotCoretime | PolkadotBulletin => 0,
-	}
-}
-
 // Parse the user-provided accounts (SS58 or hex) into raw public keys. Rejects duplicates and
 // warns when an address does not use the network's SS58 prefix.
 pub(crate) fn parse_accounts(inputs: &[String], network: &Network) -> Vec<[u8; 32]> {
-	let expected_prefix = ss58_prefix(network);
+	let expected_prefix = network.ss58_prefix();
 	let mut accounts = Vec::new();
 	for input in inputs {
 		let input = input.trim();
@@ -273,16 +258,26 @@ async fn verify_on_chain(url: &str, network: &Network, accounts: &[[u8; 32]]) {
 		None => Vec::new(),
 	};
 
-	let prefix = Ss58AddressFormat::custom(ss58_prefix(network));
+	// The per-account key lookups are independent reads of the same storage snapshot, so issue
+	// them concurrently.
+	let next_keys = futures::future::join_all(accounts.iter().map(|account| {
+		let storage = &storage;
+		async move {
+			let next_keys_query = subxt::dynamic::storage(
+				"Session",
+				"NextKeys",
+				vec![subxt::dynamic::Value::from_bytes(*account)],
+			);
+			storage.fetch(&next_keys_query).await.expect("should query Session.NextKeys")
+		}
+	}))
+	.await;
+
+	let prefix = Ss58AddressFormat::custom(network.ss58_prefix());
 	let mut failures = 0;
-	for account in accounts {
+	for (account, keys) in accounts.iter().zip(next_keys) {
 		let display = SpAccountId32::new(*account).to_ss58check_with_version(prefix);
-		let next_keys_query = subxt::dynamic::storage(
-			"Session",
-			"NextKeys",
-			vec![subxt::dynamic::Value::from_bytes(*account)],
-		);
-		match storage.fetch(&next_keys_query).await.expect("should query Session.NextKeys") {
+		match keys {
 			Some(keys) =>
 				println!("  ok: {display} has session keys 0x{}", hex::encode(keys.into_encoded())),
 			None => {
@@ -331,82 +326,20 @@ pub(crate) fn wrap_for_governance(target: &CallInfo) -> CallInfo {
 	match target.network {
 		PolkadotAssetHub | KusamaAssetHub => target.clone(),
 		PolkadotBridgeHub | PolkadotCollectives | PolkadotPeople | PolkadotCoretime
-		| PolkadotBulletin => CallInfo::from_runtime_call(NetworkRuntimeCall::PolkadotAssetHub(
-			send_as_staking_admin_polkadot(target),
-		)),
-		KusamaBridgeHub | KusamaPeople | KusamaCoretime => CallInfo::from_runtime_call(
-			NetworkRuntimeCall::KusamaAssetHub(send_as_staking_admin_kusama(target)),
-		),
+		| PolkadotBulletin => {
+			use polkadot_asset_hub::runtime_types::xcm::v3::OriginKind;
+			CallInfo::from_runtime_call(NetworkRuntimeCall::PolkadotAssetHub(
+				send_from_polkadot_asset_hub(target, OriginKind::Xcm),
+			))
+		},
+		KusamaBridgeHub | KusamaPeople | KusamaCoretime => {
+			use kusama_asset_hub::runtime_types::xcm::v3::OriginKind;
+			CallInfo::from_runtime_call(NetworkRuntimeCall::KusamaAssetHub(
+				send_from_kusama_asset_hub(target, OriginKind::Xcm),
+			))
+		},
 		Polkadot | Kusama | KusamaEncointer => panic!("no governance wrapping for this network"),
 	}
-}
-
-// Take a call, which includes its intended destination, and wrap it in XCM instructions to `send`
-// it from Polkadot Asset Hub such that it executes on its destination with the origin of the
-// sending referendum track (e.g. the StakingAdmin plurality voice), rather than as `Root`.
-fn send_as_staking_admin_polkadot(target: &CallInfo) -> PolkadotAssetHubRuntimeCall {
-	use polkadot_asset_hub::runtime_types::{
-		pallet_xcm::pallet::Call as XcmCall,
-		staging_xcm::v5::{
-			junction::Junction::Parachain, junctions::Junctions::X1, location::Location,
-			Instruction, Xcm,
-		},
-		xcm::{
-			double_encoded::DoubleEncoded, v3::OriginKind, v3::WeightLimit, VersionedLocation,
-			VersionedXcm::V5,
-		},
-	};
-
-	let para_id = target.network.get_para_id().expect("target must be a parachain");
-	let location = Location { parents: 1, interior: X1([Parachain(para_id)]) };
-
-	PolkadotAssetHubRuntimeCall::PolkadotXcm(XcmCall::send {
-		dest: Box::new(VersionedLocation::V5(location)),
-		message: Box::new(V5(Xcm(vec![
-			Instruction::UnpaidExecution {
-				weight_limit: WeightLimit::Unlimited,
-				check_origin: None,
-			},
-			Instruction::Transact {
-				origin_kind: OriginKind::Xcm,
-				fallback_max_weight: None,
-				call: DoubleEncoded { encoded: target.encoded.clone() },
-			},
-		]))),
-	})
-}
-
-// As `send_as_staking_admin_polkadot`, but sending from Kusama Asset Hub.
-fn send_as_staking_admin_kusama(target: &CallInfo) -> KusamaAssetHubRuntimeCall {
-	use kusama_asset_hub::runtime_types::{
-		pallet_xcm::pallet::Call as XcmCall,
-		staging_xcm::v5::{
-			junction::Junction::Parachain, junctions::Junctions::X1, location::Location,
-			Instruction, Xcm,
-		},
-		xcm::{
-			double_encoded::DoubleEncoded, v3::OriginKind, v3::WeightLimit, VersionedLocation,
-			VersionedXcm::V5,
-		},
-	};
-
-	let para_id = target.network.get_para_id().expect("target must be a parachain");
-	let location = Location { parents: 1, interior: X1([Parachain(para_id)]) };
-
-	KusamaAssetHubRuntimeCall::PolkadotXcm(XcmCall::send {
-		dest: Box::new(VersionedLocation::V5(location)),
-		message: Box::new(V5(Xcm(vec![
-			Instruction::UnpaidExecution {
-				weight_limit: WeightLimit::Unlimited,
-				check_origin: None,
-			},
-			Instruction::Transact {
-				origin_kind: OriginKind::Xcm,
-				fallback_max_weight: None,
-				call: DoubleEncoded { encoded: target.encoded.clone() },
-			},
-		]))),
-	})
 }
 
 // Write the proposal to disk and tell the user how to put it to referendum.
@@ -415,13 +348,12 @@ fn write_output(
 	network: &Network,
 	target_call: &CallInfo,
 	proposal: &CallInfo,
-	verified: bool,
 ) {
 	let network_name = prefs.network.to_ascii_lowercase();
 	println!("\nCall to execute on {network_name}: 0x{}", hex::encode(&target_call.encoded));
 	println!("Its hash: 0x{}", hex::encode(target_call.hash));
 
-	if verified {
+	if prefs.verify_via.is_some() {
 		println!(
 			"\nAll accounts were verified on-chain: session keys registered and not already \
 			 invulnerable. Re-verify shortly before enactment; keys can be purged in the \
@@ -441,21 +373,11 @@ fn write_output(
 	} else {
 		format!("./add-invulnerables-{network_name}.call")
 	};
-	let mut info_to_write = "0x".to_owned();
-	info_to_write.push_str(hex::encode(&proposal.encoded).as_str());
-	fs::write(&fname, info_to_write).expect("it should write");
+	write_call_data(&fname, &proposal.encoded);
 
 	println!("\nSuccess! The proposal was written to {fname}");
 	println!("To submit this as a referendum in OpenGov, run:");
-	let relay = match network {
-		Network::Kusama
-		| Network::KusamaAssetHub
-		| Network::KusamaEncointer
-		| Network::KusamaBridgeHub
-		| Network::KusamaPeople
-		| Network::KusamaCoretime => "kusama",
-		_ => "polkadot",
-	};
+	let relay = if network.is_kusama() { "kusama" } else { "polkadot" };
 	println!("\nopengov-cli submit-referendum \\");
 	println!("    --proposal \"{fname}\" \\");
 	println!("    --network \"{relay}\" --track staking-admin");
