@@ -57,6 +57,11 @@ pub(crate) struct UpgradeArgs {
 	#[clap(long = "coretime")]
 	pub(crate) coretime: Option<String>,
 
+	/// Optional. The runtime version of Bulletin to which to upgrade. If not provided, it will use
+	/// the Relay Chain's version. Only applicable to Polkadot.
+	#[clap(long = "bulletin")]
+	pub(crate) bulletin: Option<String>,
+
 	/// Name of the file to which to write the output. If not provided, a default will be
 	/// constructed.
 	#[clap(long = "filename")]
@@ -125,6 +130,7 @@ pub(crate) fn parse_inputs(prefs: UpgradeArgs) -> UpgradeDetails {
 	let coretime_version = chain_version(prefs.coretime, relay_version.clone(), only);
 	let encointer_version = chain_version(prefs.encointer, relay_version.clone(), only);
 	let collectives_version = chain_version(prefs.collectives, relay_version.clone(), only);
+	let bulletin_version = chain_version(prefs.bulletin, relay_version.clone(), only);
 
 	let relay = match prefs.network.to_ascii_lowercase().as_str() {
 		"polkadot" => {
@@ -146,6 +152,9 @@ pub(crate) fn parse_inputs(prefs: UpgradeArgs) -> UpgradeDetails {
 			}
 			if let Some(v) = coretime_version.clone() {
 				networks.push(VersionedNetwork { network: Network::PolkadotCoretime, version: v });
+			}
+			if let Some(v) = bulletin_version.clone() {
+				networks.push(VersionedNetwork { network: Network::PolkadotBulletin, version: v });
 			}
 			Network::Polkadot
 		},
@@ -191,11 +200,12 @@ pub(crate) fn parse_inputs(prefs: UpgradeArgs) -> UpgradeDetails {
 	let no_runtime_checks = prefs.no_runtime_checks;
 
 	// Get a version from one of the args. (This still feels dirty.)
-	let version = relay_version.clone().unwrap_or(asset_hub_version.unwrap_or(
-		bridge_hub_version.unwrap_or(encointer_version.unwrap_or(collectives_version.unwrap_or(
-			coretime_version.unwrap_or(people_version.unwrap_or(String::from("no-version"))),
-		))),
-	));
+	let version =
+		relay_version.clone().unwrap_or(asset_hub_version.unwrap_or(bridge_hub_version.unwrap_or(
+			encointer_version.unwrap_or(collectives_version.unwrap_or(coretime_version.unwrap_or(
+				people_version.unwrap_or(bulletin_version.unwrap_or(String::from("no-version"))),
+			))),
+		)));
 
 	// Set up a directory to store information fetched/written during this program.
 	let directory = format!("./upgrade-{}-{}/", &prefs.network, &version);
@@ -256,6 +266,7 @@ async fn download_runtimes(upgrade_details: &UpgradeDetails) {
 			Network::PolkadotBridgeHub => "bridge-hub-polkadot",
 			Network::PolkadotPeople => "people-polkadot",
 			Network::PolkadotCoretime => "coretime-polkadot",
+			Network::PolkadotBulletin => "bulletin-polkadot",
 		};
 		let runtime_version = semver_to_intver(&chain.version);
 		let fname = format!("{chain_name}_runtime-v{runtime_version}.compact.compressed.wasm");
@@ -509,6 +520,23 @@ fn generate_authorize_upgrade_calls(upgrade_details: &UpgradeDetails) -> Vec<Cal
 
 				let call = CallInfo::from_runtime_call(NetworkRuntimeCall::PolkadotCoretime(
 					PolkadotCoretimeRuntimeCall::System(Call::authorize_upgrade {
+						code_hash: H256(runtime_hash),
+					}),
+				));
+				authorization_calls.push(call);
+			},
+			Network::PolkadotBulletin => {
+				use polkadot_bulletin::runtime_types::frame_system::pallet::Call;
+				let path = format!(
+					"{}bulletin-polkadot_runtime-v{}.compact.compressed.wasm",
+					upgrade_details.directory, runtime_version
+				);
+				let runtime = fs::read(path).expect("Should give a valid file path");
+				let runtime_hash = blake2_256(&runtime);
+				println!("Polkadot Bulletin Runtime Hash:    0x{}", hex::encode(runtime_hash));
+
+				let call = CallInfo::from_runtime_call(NetworkRuntimeCall::PolkadotBulletin(
+					PolkadotBulletinRuntimeCall::System(Call::authorize_upgrade {
 						code_hash: H256(runtime_hash),
 					}),
 				));
